@@ -1,16 +1,14 @@
 package org.apache.pdfbox.pdmodel.font;
 
 import org.apache.fontbox.ttf.*;
-import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.pdmodel.PDDocument;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Set;
 
 public class PDCIDFontType2EmbedderHelper {
 
-    public static byte[] embedPDCIDFontType2(PDDocument document, PDFont font, OpenTypeFont ttf,
+    public static void embedPDCIDFontType2(PDDocument document, PDFont font, OpenTypeFont ttf,
         boolean vertical, Set<Integer> codePoints) throws IOException {
 
         var postScriptTable = new PostScriptTableHelper(ttf);
@@ -27,12 +25,10 @@ public class PDCIDFontType2EmbedderHelper {
         ttf.getTableMap().put(CmapTable.TAG, cmapTable);
 
         var dict = font.getCOSObject();
-        var embedded = new PDCIDFontType2Embedder(document, dict, ttf, true, null, vertical);
+        var embedded = new PDCIDFontType2Embedder(document, dict, ttf, true, (PDType0Font) font, vertical);
         for (Integer codePoint : codePoints) {
             embedded.addToSubset(codePoint);
         }
         embedded.subset();
-
-        return new PDType0Font(dict).getFontDescriptor().getFontFile2().toByteArray();
     }
 }
