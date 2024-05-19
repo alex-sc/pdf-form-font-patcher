@@ -1,6 +1,8 @@
 package com.itextpdf.io.font;
 
 import com.github.alexsc.pdf.CustomPdfRenderer;
+import com.itextpdf.signatures.BouncyCastleDigest;
+import com.itextpdf.signatures.DigestAlgorithms;
 import org.apache.fontbox.ttf.OTFParser;
 import org.apache.fontbox.ttf.OpenTypeFont;
 import org.apache.pdfbox.cos.COSDictionary;
@@ -10,19 +12,26 @@ import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.font.*;
 import org.apache.pdfbox.pdmodel.interactive.form.PDField;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.*;
+import java.math.BigInteger;
+import java.security.Security;
 import java.util.*;
+import java.util.stream.Stream;
 
 public class PdfFontPatcher {
+    static {
+        Security.addProvider(new BouncyCastleProvider());
+    }
 
     private PdfFontPatcher() {
         // Utility class
     }
 
     public static void main(String[] args) throws IOException {
-        var input = new File("form.pdf");
-        var output = new File("form-patched.pdf");
+        var input = new File("forms/FDA-356h_AcroForm_Sec_07-07-2023_0.pdf");
+        var output = new File("forms/FDA-356h_AcroForm_Sec_07-07-2023_0-optimized.pdf");
         optimizeFonts(input, output);
     }
 
@@ -30,14 +39,13 @@ public class PdfFontPatcher {
         System.out.println("Processing " + input);
         PDDocument doc = PDDocument.load(input);
 
-        // Remove forms fields' default appearance
         var acroForm = doc.getDocumentCatalog().getAcroForm();
         if (acroForm != null) {
+            // Remove forms fields' default appearance
             for (Iterator<PDField> it = acroForm.getFieldIterator(); it.hasNext(); ) {
                 PDField field = it.next();
-                var widgets = field.getWidgets();
-                if (widgets != null && !widgets.isEmpty()) {
-                    widgets.get(0).getCOSObject().removeItem(COSName.DA);
+                for (var widget : field.getWidgets()) {
+                    widget.getCOSObject().removeItem(COSName.DA);
                 }
             }
 
@@ -49,17 +57,19 @@ public class PdfFontPatcher {
             }
         }
 
+        int totalFontSize = 0;
+
+        // Collect used glyphs on all pages
+        CustomPdfRenderer renderer = new CustomPdfRenderer(doc);
+        var patchedStreamMap = new HashMap<String, PDStream>();
         for (int i = 0; i < doc.getNumberOfPages(); i++) {
-            var page = doc.getPage(i);
-
-            // Detect actually used fonts
-            //PdfGlyphUsageCounter usageCounter = new PdfGlyphUsageCounter(page, doc);
-            //usageCounter.processPage(page);
-
-            CustomPdfRenderer renderer = new CustomPdfRenderer(doc);
             renderer.renderImage(i);
-            var usedCodes = renderer.getUsedCodes();
-            var patchedStreamMap = new HashMap<String, PDStream>();
+        }
+        var usedCodes = renderer.getUsedCodes();
+
+        for (int i = 0; i < doc.getNumberOfPages(); i++) {
+            System.out.println("Processing page " + i);
+            var page = doc.getPage(i);
 
             PDResources pageResources = page.getResources();
             COSDictionary pageFonts = pageResources.getCOSObject().getCOSDictionary(COSName.FONT);
@@ -68,24 +78,26 @@ public class PdfFontPatcher {
                 PDFont font = pageResources.getFont(name);
                 var streamSize = getFontStreamSize(font);
                 if (streamSize == 0) {
+                    // Nothing to optimize
                     continue;
                 }
+                totalFontSize += streamSize;
 
                 var key = font.getName();
                 var used = usedCodes.get(key);
                 if (used != null) {
-                    if (!key.startsWith("BCZRWE")) {
-                        //continue;
-                    }
                     try {
-                        var patchedStream = patchedStreamMap.get(key);
+                        String fontDigest = new BigInteger(DigestAlgorithms.digest(new ByteArrayInputStream(getFontBytes(font)), DigestAlgorithms.SHA1, BouncyCastleProvider.PROVIDER_NAME)).toString(16);
+
+                        var patchedStream = patchedStreamMap.get(fontDigest);
                         if (patchedStream != null) {
-                            font.getFontDescriptor().setFontFile3(patchedStream);
+                            System.out.println("Using cache " + font.getName() + " " + used.size() + ": " + name + " " + streamSize + " " + used.size());
+                            setFontBytes(font, patchedStream);
                         } else {
-                            System.out.println("Optimizing used font " + font.getName() + " " + used.size() + ": " + name + " " + streamSize);
+                            System.out.println("Optimizing used font " + font.getName() + " " + used.size() + ": " + name + " " + streamSize + " " + used.size());
                             var patched = optimizeFont(font, doc, used);
                             if (patched != null) {
-                                patchedStreamMap.put(key, patched);
+                                patchedStreamMap.put(fontDigest, patched);
                             }
                         }
                     } catch (Exception e) {
@@ -99,8 +111,11 @@ public class PdfFontPatcher {
             }
         }
 
+        doc.setAllSecurityToBeRemoved(true);
         doc.save(output);
+        doc.close();
 
+        System.out.println("total font size " + totalFontSize);
         System.out.println("Optimized file " + input.getName()  + " from " + input.length() + " to " + output.length());
     }
 
@@ -122,7 +137,13 @@ public class PdfFontPatcher {
     }
 
     private static PDStream optimizeFont(PDFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
+        if (font instanceof PDTrueTypeFont) {
+            System.out.println("Processing TrueType font " + font.getName() + " with used glyph count = " + usedCodes.size() + " and fontFile size = " + getFontStreamSize(font));
+            return optimizeTrueTypeFont((PDTrueTypeFont) font, doc, usedCodes);
+        }
+
         if (!(font instanceof PDType0Font)) {
+            System.err.println("Unexpected font " + font.getName() + " " + font.getClass());
             return null;
         }
 
@@ -132,7 +153,7 @@ public class PdfFontPatcher {
         // Type FontFile3
         // Subtype CIDFontType0C or Type1C
         if (fontFile3 != null && "CIDFontType0C".equals(fontFile3.getCOSObject().getNameAsString(COSName.SUBTYPE))) {
-            System.out.println("Processing CIDFontType0C font " + font.getName());
+            System.out.println("Processing CIDFontType0C font " + font.getName() + " with used glyph count = " + usedCodes.size() + " and fontFile size = " + getFontStreamSize(font));
             return optimizeCIDFontType0C(font, doc, usedCodes);
         }
 
@@ -149,6 +170,10 @@ public class PdfFontPatcher {
         return null;
     }
 
+    private static PDStream optimizeTrueTypeFont(PDTrueTypeFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
+        return PDCIDFontType2EmbedderHelper.embedTrueTypeFont(font, doc, usedCodes);
+    }
+
     private static void optimizeCIDTrueType(PDFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
         var bytes = getFontBytes(font);
 
@@ -160,9 +185,7 @@ public class PdfFontPatcher {
     }
 
     private static PDStream optimizeCIDFontType0C(PDFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
-        var descriptor = font.getFontDescriptor();
         var bytes = getFontBytes(font);
-        var fontFile = descriptor.getFontFile3();
 
         // Temp subset just to get the number of glyphs
         var tmpSubset = new CFFFontSubset(bytes, Set.of(0), true);
@@ -178,21 +201,13 @@ public class PdfFontPatcher {
         // Rebuild the font
         var subsetBytes = new CFFFontSubset(bytes, allGlyphs).Process();
 
-        // Put the stream back
-        PDStream stream = new PDStream(doc);
-        stream.getCOSObject().setName(COSName.SUBTYPE, fontFile.getCOSObject().getNameAsString(COSName.SUBTYPE));
-        var os = stream.createOutputStream(COSName.FLATE_DECODE);
-        os.write(subsetBytes);
-        os.close();
-
         System.out.println("From " + bytes.length + " to " + subsetBytes.length);
 
-        font.getFontDescriptor().setFontFile3(stream);
-
-        return stream;
+        // Put the stream back
+        return setFontBytes(font, doc, subsetBytes);
     }
 
-    private static byte[] getFontBytes(PDFont font) throws IOException {
+    public static byte[] getFontBytes(PDFont font) throws IOException {
         var descriptor = font.getFontDescriptor();
         return Arrays.asList(descriptor.getFontFile(), descriptor.getFontFile2(), descriptor.getFontFile3())
                 .stream()
@@ -200,4 +215,37 @@ public class PdfFontPatcher {
                 .findFirst().get().toByteArray();
 
     }
+
+    public static PDStream setFontBytes(PDFont font, PDDocument doc, byte[] bytes) throws IOException {
+        var descriptor = font.getFontDescriptor();
+        var fontFile = Stream.of(descriptor.getFontFile(), descriptor.getFontFile2(), descriptor.getFontFile3())
+                .filter(Objects::nonNull)
+                .findFirst().get();
+
+        PDStream stream = new PDStream(doc);
+        var subType = fontFile.getCOSObject().getNameAsString(COSName.SUBTYPE);
+        if (subType != null) {
+            stream.getCOSObject().setName(COSName.SUBTYPE, subType);
+        }
+        stream.getCOSObject().setInt(COSName.LENGTH1, bytes.length);
+        var os = stream.createOutputStream(COSName.FLATE_DECODE);
+        os.write(bytes);
+        os.close();
+
+        setFontBytes(font, stream);
+
+        return stream;
+    }
+
+    private static void setFontBytes(PDFont font, PDStream stream) {
+        var descriptor = font.getFontDescriptor();
+        if (descriptor.getFontFile() != null) {
+            descriptor.setFontFile(stream);
+        } else if (descriptor.getFontFile2() != null) {
+            descriptor.setFontFile2(stream);
+        } else {
+            descriptor.setFontFile3(stream);
+        }
+    }
+
 }
