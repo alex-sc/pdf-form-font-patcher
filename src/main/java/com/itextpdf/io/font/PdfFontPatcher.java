@@ -1,12 +1,13 @@
 package com.itextpdf.io.font;
 
 import com.github.alexsc.pdf.CustomPdfRenderer;
-import com.itextpdf.signatures.BouncyCastleDigest;
 import com.itextpdf.signatures.DigestAlgorithms;
 import org.apache.fontbox.ttf.OTFParser;
 import org.apache.fontbox.ttf.OpenTypeFont;
+import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.io.RandomAccessReadBuffer;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDStream;
@@ -16,6 +17,7 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.*;
 import java.math.BigInteger;
+import java.security.GeneralSecurityException;
 import java.security.Security;
 import java.util.*;
 import java.util.stream.Stream;
@@ -30,14 +32,14 @@ public class PdfFontPatcher {
     }
 
     public static void main(String[] args) throws IOException {
-        var input = new File("forms/FDA-356h_AcroForm_Sec_07-07-2023_0.pdf");
-        var output = new File("forms/FDA-356h_AcroForm_Sec_07-07-2023_0-optimized.pdf");
+        var input = new File("forms/FDA-431a_Dyn_Sec_Ext_08-25-2022.pdf");
+        var output = new File("forms/opt.pdf");
         optimizeFonts(input, output);
     }
 
     public static void optimizeFonts(File input, File output) throws IOException {
         System.out.println("Processing " + input);
-        PDDocument doc = PDDocument.load(input);
+        PDDocument doc = Loader.loadPDF(input);
 
         var acroForm = doc.getDocumentCatalog().getAcroForm();
         if (acroForm != null) {
@@ -57,8 +59,6 @@ public class PdfFontPatcher {
             }
         }
 
-        int totalFontSize = 0;
-
         // Collect used glyphs on all pages
         CustomPdfRenderer renderer = new CustomPdfRenderer(doc);
         var patchedStreamMap = new HashMap<String, PDStream>();
@@ -67,45 +67,54 @@ public class PdfFontPatcher {
         }
         var usedCodes = renderer.getUsedCodes();
 
+        // Optimize fonts on all pages
+        Set<String> processedStreams = new HashSet<>();
         for (int i = 0; i < doc.getNumberOfPages(); i++) {
             System.out.println("Processing page " + i);
             var page = doc.getPage(i);
 
             PDResources pageResources = page.getResources();
             COSDictionary pageFonts = pageResources.getCOSObject().getCOSDictionary(COSName.FONT);
+            if (pageFonts == null) {
+                pageFonts = new COSDictionary();
+            }
 
             for (COSName name : pageFonts.keySet()) {
                 PDFont font = pageResources.getFont(name);
+
                 var streamSize = getFontStreamSize(font);
                 if (streamSize == 0) {
                     // Nothing to optimize
                     continue;
                 }
-                totalFontSize += streamSize;
 
-                var key = font.getName();
+                String key = getFontContentDigest(font);
+                if (processedStreams.contains(key)) {
+                    continue;
+                }
                 var used = usedCodes.get(key);
                 if (used != null) {
                     try {
-                        String fontDigest = new BigInteger(DigestAlgorithms.digest(new ByteArrayInputStream(getFontBytes(font)), DigestAlgorithms.SHA1, BouncyCastleProvider.PROVIDER_NAME)).toString(16);
-
-                        var patchedStream = patchedStreamMap.get(fontDigest);
+                        var patchedStream = patchedStreamMap.get(key);
                         if (patchedStream != null) {
-                            System.out.println("Using cache " + font.getName() + " " + used.size() + ": " + name + " " + streamSize + " " + used.size());
+                            System.out.println("Using cache " + font.getName());
                             setFontBytes(font, patchedStream);
                         } else {
-                            System.out.println("Optimizing used font " + font.getName() + " " + used.size() + ": " + name + " " + streamSize + " " + used.size());
+                            System.out.println("Optimizing used font " + font.getName() + " " + used.size() + ": " + name + " " + streamSize + " " + used.size() + ": " + key) ;
                             var patched = optimizeFont(font, doc, used);
                             if (patched != null) {
-                                patchedStreamMap.put(fontDigest, patched);
+                                patchedStreamMap.put(key, patched);
                             }
+                            usedCodes.put(getFontContentDigest(font), usedCodes.get(key));
+
+                            processedStreams.add(getFontContentDigest(font));
                         }
                     } catch (Exception e) {
                         // Ignore
                         e.printStackTrace();
                     }
                 } else {
-                    System.out.println("Removing unused font " + font.getName() + " " + name + ": " + getFontStreamSize(font));
+                    System.out.println("Removing unused font " + font.getName() + " " + name + ": " + getFontStreamSize(font) + ": " + key);
                     pageFonts.removeItem(name);
                 }
             }
@@ -115,8 +124,15 @@ public class PdfFontPatcher {
         doc.save(output);
         doc.close();
 
-        System.out.println("total font size " + totalFontSize);
         System.out.println("Optimized file " + input.getName()  + " from " + input.length() + " to " + output.length());
+    }
+
+    public static String getFontContentDigest(PDFont font) throws IOException {
+        try {
+            return new BigInteger(DigestAlgorithms.digest(new ByteArrayInputStream(getFontBytes(font)), DigestAlgorithms.SHA1, BouncyCastleProvider.PROVIDER_NAME)).toString(16);
+        } catch (GeneralSecurityException e) {
+            throw new IOException(e);
+        }
     }
 
     private static int getFontStreamSize(PDFont font) throws IOException {
@@ -142,9 +158,13 @@ public class PdfFontPatcher {
             return optimizeTrueTypeFont((PDTrueTypeFont) font, doc, usedCodes);
         }
 
+        if (font instanceof PDType1CFont) {
+            System.out.println("Processing Type1C font " + font.getName() + " with used glyph count = " + usedCodes.size() + " and fontFile size = " + getFontStreamSize(font));
+            return optimizeType1CFont((PDType1CFont) font, doc, usedCodes);
+        }
+
         if (!(font instanceof PDType0Font)) {
-            System.err.println("Unexpected font " + font.getName() + " " + font.getClass());
-            return null;
+            throw new IllegalStateException("Unexpected font " + font.getName() + " " + font.getClass());
         }
 
         var descriptor = font.getFontDescriptor();
@@ -170,6 +190,10 @@ public class PdfFontPatcher {
         return null;
     }
 
+    private static PDStream optimizeType1CFont(PDType1CFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
+        return null;
+    }
+
     private static PDStream optimizeTrueTypeFont(PDTrueTypeFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
         return PDCIDFontType2EmbedderHelper.embedTrueTypeFont(font, doc, usedCodes);
     }
@@ -178,24 +202,28 @@ public class PdfFontPatcher {
         var bytes = getFontBytes(font);
 
         var otfParser = new OTFParser(true);
-        OpenTypeFont otfFont = otfParser.parse(new ByteArrayInputStream(bytes));
+        OpenTypeFont otfFont = otfParser.parse(new RandomAccessReadBuffer(bytes));
         PDCIDFontType2EmbedderHelper.embedPDCIDFontType2(doc, font, otfFont, font.isVertical(), usedCodes);
 
         System.out.println("From " + bytes.length + " to " + getFontBytes(font).length);
     }
 
     private static PDStream optimizeCIDFontType0C(PDFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
+        return optimizeGenericCffFont(font, doc, usedCodes);
+    }
+
+    private static PDStream optimizeGenericCffFont(PDFont font, PDDocument doc, Set<Integer> usedCodes) throws IOException {
         var bytes = getFontBytes(font);
 
         // Temp subset just to get the number of glyphs
         var tmpSubset = new CFFFontSubset(bytes, Set.of(0), true);
-        var fdSelect = tmpSubset.fonts[0].FDSelect;
         var allGlyphs = new HashSet<Integer>();
         // TODO: is this okay?
-        for (int i = 0; i < fdSelect.length; i++) {
-            //if (usedCodes.contains(tmpSubset.fonts[0].gidToCid[i])) {
+        System.err.println(tmpSubset.fonts[0].nglyphs);
+        for (int i = 0; i < tmpSubset.fonts[0].nglyphs - 1; i++) {
+            if (usedCodes.contains(tmpSubset.fonts[0].gidToCid[i])) {
                 allGlyphs.add(i);
-            //}
+            }
         }
 
         // Rebuild the font
@@ -207,13 +235,26 @@ public class PdfFontPatcher {
         return setFontBytes(font, doc, subsetBytes);
     }
 
-    public static byte[] getFontBytes(PDFont font) throws IOException {
+    public static PDStream getFontStream(PDFont font) throws IOException {
         var descriptor = font.getFontDescriptor();
         return Arrays.asList(descriptor.getFontFile(), descriptor.getFontFile2(), descriptor.getFontFile3())
                 .stream()
                 .filter(Objects::nonNull)
-                .findFirst().get().toByteArray();
+                .findFirst().get();
 
+    }
+
+    public static byte[] getFontBytes(PDFont font) throws IOException {
+        var descriptor = font.getFontDescriptor();
+        var stream = Arrays.asList(descriptor.getFontFile(), descriptor.getFontFile2(), descriptor.getFontFile3())
+                .stream()
+                .filter(Objects::nonNull)
+                .findFirst();
+        if (stream.isPresent()) {
+            return stream.get().toByteArray();
+        } else {
+            return new byte[0];
+        }
     }
 
     public static PDStream setFontBytes(PDFont font, PDDocument doc, byte[] bytes) throws IOException {
@@ -247,5 +288,4 @@ public class PdfFontPatcher {
             descriptor.setFontFile3(stream);
         }
     }
-
 }

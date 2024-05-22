@@ -1,16 +1,16 @@
 package org.apache.pdfbox.pdmodel.font;
 
-import com.itextpdf.io.font.PdfFontPatcher;
+import com.itextpdf.io.font.*;
+import com.itextpdf.io.font.TrueTypeFont;
 import org.apache.fontbox.ttf.*;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.common.PDStream;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Set;
 
 public class PDCIDFontType2EmbedderHelper {
@@ -18,7 +18,7 @@ public class PDCIDFontType2EmbedderHelper {
     public static void embedPDCIDFontType2(PDDocument document, PDFont font, OpenTypeFont ttf,
                                            boolean vertical, Set<Integer> codePoints) throws IOException {
 
-        var postScriptTable = new PostScriptTableHelper(ttf);
+        var postScriptTable = new PostScriptTableHelper();
         ttf.getTableMap().put(PostScriptTable.TAG, postScriptTable);
 
         var cmap = font.getToUnicodeCMap();
@@ -43,19 +43,26 @@ public class PDCIDFontType2EmbedderHelper {
         var bytes = PdfFontPatcher.getFontBytes(font);
         Files.write(Path.of("font-before.ttf"), bytes);
 
-        var ttFont = new TTFParser(true).parse(new ByteArrayInputStream(bytes));
-        var tableNames = new ArrayList<>(ttFont.getTableMap().keySet());
-        tableNames.remove("post");
-        var ttSubsetter = new TTFSubsetter(ttFont, tableNames);
-        ttSubsetter.addAll(usedCodes);
+        TrueTypeFont fpf = (TrueTypeFont) FontProgramFactory.createFont(bytes);
+        Set<Integer> usedGlyphs = new HashSet<>();
+        for (Integer usedCode : usedCodes) {
+            // System.err.println(usedCode + " " + (char) usedCode.intValue() + " " + Arrays.toString(fpf.getGlyphByCode(usedCode).getChars()) + " " + fpf.getGlyphByCode(usedCode).getUnicode());
+            //usedGlyphs.add(fpf.getGlyphByCode(usedCode).getUnicode());
+            usedGlyphs.add(usedCode);
+        }
 
-        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        ttSubsetter.writeToStream(outputStream);
-        var newBytes = outputStream.toByteArray();
+        var newBytes2 = fpf.getSubset(usedGlyphs, true);
+        /*
+        System.err.println(fpf.getClass());
+        System.err.println(fpf.mapGlyphsCidsToGids(usedCodes));
+        var ssHelper = new TrueTypeFontSubsetHelper(null, new RandomAccessFileOrArray(new RandomAccessSourceFactory().createSource(bytes)),
+                usedCodes, 0, true);
+        var newBytes2 = ssHelper.process();
+         */
 
-        System.out.println("From " + bytes.length + " to " + newBytes.length);
-        Files.write(Path.of("font-after.ttf"), newBytes);
+        System.out.println("From " + bytes.length + " to " + newBytes2.length);
+        Files.write(Path.of("font-after.ttf"), newBytes2);
 
-        return PdfFontPatcher.setFontBytes(font, doc, newBytes);
+        return PdfFontPatcher.setFontBytes(font, doc, newBytes2);
     }
 }
