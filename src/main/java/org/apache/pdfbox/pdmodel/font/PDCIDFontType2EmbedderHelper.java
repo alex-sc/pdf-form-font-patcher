@@ -46,19 +46,10 @@ public class PDCIDFontType2EmbedderHelper {
         TrueTypeFont fpf = (TrueTypeFont) FontProgramFactory.createFont(bytes);
         Set<Integer> usedGlyphs = new HashSet<>();
         for (Integer usedCode : usedCodes) {
-            // System.err.println(usedCode + " " + (char) usedCode.intValue() + " " + Arrays.toString(fpf.getGlyphByCode(usedCode).getChars()) + " " + fpf.getGlyphByCode(usedCode).getUnicode());
-            //usedGlyphs.add(fpf.getGlyphByCode(usedCode).getUnicode());
-            usedGlyphs.add(usedCode);
+            usedGlyphs.add(font.codeToGID(usedCode));
         }
 
-        var newBytes2 = fpf.getSubset(usedGlyphs, true);
-        /*
-        System.err.println(fpf.getClass());
-        System.err.println(fpf.mapGlyphsCidsToGids(usedCodes));
-        var ssHelper = new TrueTypeFontSubsetHelper(null, new RandomAccessFileOrArray(new RandomAccessSourceFactory().createSource(bytes)),
-                usedCodes, 0, true);
-        var newBytes2 = ssHelper.process();
-         */
+        var newBytes2 = fpf.getSubset(usedGlyphs, false);
 
         System.out.println("From " + bytes.length + " to " + newBytes2.length);
         Files.write(Path.of("font-after.ttf"), newBytes2);
